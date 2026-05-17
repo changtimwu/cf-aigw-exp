@@ -1,12 +1,12 @@
 import type { Env } from "./env.js";
 
-export type User = {
+// Static user identity + config. The live counters
+// (tokens_used, last_request_at) live in a Durable Object — see usage.ts.
+export type UserRecord = {
   sub: string;
   allowed_models: string[]; // empty array = unrestricted
   token_budget: number;     // 0 = unlimited
-  tokens_used: number;
   created_at: number;
-  last_request_at: number;
   revoked: boolean;
 };
 
@@ -32,18 +32,18 @@ export function generateApiKey(): string {
   return API_KEY_PREFIX + toHex(bytes);
 }
 
-export async function getUserByApiKey(env: Env, apiKey: string): Promise<User | null> {
+export async function getUserByApiKey(env: Env, apiKey: string): Promise<UserRecord | null> {
   if (!apiKey.startsWith(API_KEY_PREFIX)) return null;
   const hash = await hashApiKey(apiKey);
   const raw = await env.USERS.get(`apikey:${hash}`);
-  return raw ? (JSON.parse(raw) as User) : null;
+  return raw ? (JSON.parse(raw) as UserRecord) : null;
 }
 
-export async function getUserBySub(env: Env, sub: string): Promise<User | null> {
+export async function getUserBySub(env: Env, sub: string): Promise<UserRecord | null> {
   const hash = await env.USERS.get(`sub:${sub}`);
   if (!hash) return null;
   const raw = await env.USERS.get(`apikey:${hash}`);
-  return raw ? (JSON.parse(raw) as User) : null;
+  return raw ? (JSON.parse(raw) as UserRecord) : null;
 }
 
 export type CreateUserInput = {
@@ -55,7 +55,7 @@ export type CreateUserInput = {
 export async function createUser(
   env: Env,
   input: CreateUserInput,
-): Promise<{ user: User; api_key: string }> {
+): Promise<{ user: UserRecord; api_key: string }> {
   const existing = await env.USERS.get(`sub:${input.sub}`);
   if (existing) {
     throw new HttpError(409, "user_already_exists");
@@ -63,13 +63,11 @@ export async function createUser(
   const api_key = generateApiKey();
   const hash = await hashApiKey(api_key);
   const now = Math.floor(Date.now() / 1000);
-  const user: User = {
+  const user: UserRecord = {
     sub: input.sub,
     allowed_models: input.allowed_models ?? DEFAULT_ALLOWED_MODELS,
     token_budget: input.token_budget ?? DEFAULT_TOKEN_BUDGET,
-    tokens_used: 0,
     created_at: now,
-    last_request_at: 0,
     revoked: false,
   };
   await env.USERS.put(`apikey:${hash}`, JSON.stringify(user));
@@ -77,55 +75,29 @@ export async function createUser(
   return { user, api_key };
 }
 
-export async function revokeUser(env: Env, sub: string): Promise<User | null> {
+export async function revokeUser(env: Env, sub: string): Promise<UserRecord | null> {
   const hash = await env.USERS.get(`sub:${sub}`);
   if (!hash) return null;
   const raw = await env.USERS.get(`apikey:${hash}`);
   if (!raw) return null;
-  const user = JSON.parse(raw) as User;
+  const user = JSON.parse(raw) as UserRecord;
   user.revoked = true;
   await env.USERS.put(`apikey:${hash}`, JSON.stringify(user));
   return user;
 }
 
-export async function resetUsage(env: Env, sub: string): Promise<User | null> {
-  const hash = await env.USERS.get(`sub:${sub}`);
-  if (!hash) return null;
-  const raw = await env.USERS.get(`apikey:${hash}`);
-  if (!raw) return null;
-  const user = JSON.parse(raw) as User;
-  user.tokens_used = 0;
-  await env.USERS.put(`apikey:${hash}`, JSON.stringify(user));
-  return user;
-}
-
-export async function listUsers(env: Env): Promise<User[]> {
-  const out: User[] = [];
+export async function listUsers(env: Env): Promise<UserRecord[]> {
+  const out: UserRecord[] = [];
   let cursor: string | undefined;
   do {
     const list = await env.USERS.list({ prefix: "apikey:", cursor });
     for (const k of list.keys) {
       const raw = await env.USERS.get(k.name);
-      if (raw) out.push(JSON.parse(raw) as User);
+      if (raw) out.push(JSON.parse(raw) as UserRecord);
     }
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
   return out;
-}
-
-// Increment usage by addedTokens; called from a waitUntil after the response
-// is parsed. KV writes are eventually consistent and rate-limited (~1/s per
-// key globally) — acceptable for PoC scale, document as a Phase-3 limitation.
-export async function incrementUsage(
-  env: Env,
-  user: User,
-  apiKeyHash: string,
-  addedTokens: number,
-): Promise<void> {
-  if (addedTokens <= 0) return;
-  user.tokens_used += addedTokens;
-  user.last_request_at = Math.floor(Date.now() / 1000);
-  await env.USERS.put(`apikey:${apiKeyHash}`, JSON.stringify(user));
 }
 
 export class HttpError extends Error {

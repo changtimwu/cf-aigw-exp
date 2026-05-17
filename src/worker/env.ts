@@ -1,3 +1,5 @@
+import type { UsageCounter } from "./usage.js";
+
 export interface Env {
   // Plain vars (set in wrangler.toml [vars] or .dev.vars).
   CF_ACCOUNT_ID: string;
@@ -7,9 +9,12 @@ export interface Env {
   CF_AIGW_TOKEN: string;
   ADMIN_TOKEN: string;
 
-  // KV namespace holding per-user records.
+  // KV namespace holding per-user identity + config.
   // Layout:
-  //   apikey:<sha256-hex>  → User JSON  (hot path; auth lookup)
-  //   sub:<sub>            → <sha256-hex> (admin lookup by username)
+  //   apikey:<sha256-hex>  → UserRecord JSON  (hot path; auth lookup)
+  //   sub:<sub>            → <sha256-hex>     (admin lookup by username)
   USERS: KVNamespace;
+
+  // Durable Object: per-user usage counter, atomic. See src/worker/usage.ts.
+  USAGE: DurableObjectNamespace<UsageCounter>;
 }

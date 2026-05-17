@@ -1,92 +1,101 @@
 # CLAUDE.md
 
 Guidance for Claude when working in this repo. The user-facing
-overview lives in [README.md](README.md); this file captures the
-decisions and conventions a future Claude session won't pick up
-from the code alone.
+overview lives in [README.md](README.md); capacity ceilings live in
+[SCALING.md](SCALING.md). This file captures the decisions and
+conventions a future Claude session won't pick up from the code alone.
 
 ## What this repo is
 
-A small TypeScript proof-of-concept that proxies an OpenAI-using
-desktop app's traffic through **Cloudflare AI Gateway**, with a
-**Cloudflare Worker** in front of the gateway that does per-user
-auth (KV-backed opaque API keys), model allow-listing, and token
-budget enforcement. Exists because the app is being productized —
-a fixed OpenAI key can no longer be embedded in distributed
-binaries, and per-user controls are needed.
+A TypeScript proof-of-concept that proxies an OpenAI-using desktop
+app's traffic through **Cloudflare AI Gateway**, with a
+**Cloudflare Worker** in front that does per-user auth (KV-backed
+opaque API keys), model allow-listing, token budget enforcement,
+and atomic per-user usage counting in **Durable Objects** —
+including streaming chat. Exists because the app is being
+productized.
 
-The repo currently implements **Phases 1, 2 (history), 3**:
-- Phase 1: three probes that exercise AI Gateway directly with BYOK.
-- Phase 2 (in git history, superseded): a Worker validating per-user
-  HS256 JWTs. The KV-less version. Removed in Phase 3 because the
-  opaque-API-key + KV-user-store pattern matches the desktop-app
-  use case better. If you need to reintroduce JWTs (e.g. for a
-  browser-based client with an external auth backend), git history
-  has the working code.
-- Phase 3: Worker with KV-backed user store, opaque API keys, model
-  allow-list, token budget, revocation, admin endpoints + CLI.
+The repo implements **Phases 1, 2 (history), 3, 4**:
+- Phase 1: probes against AI Gateway with BYOK.
+- Phase 2 (superseded, in git history): Worker validating per-user
+  HS256 JWTs. The KV-less version. Replaced because opaque API keys
+  + KV match the desktop-app use case better.
+- Phase 3: Worker with KV-backed users, opaque API keys, model
+  allow-list, token budget, revocation, admin endpoints. Counters
+  lived in KV — limited to ~1 write/sec per user.
+- Phase 4: per-user counters move to a Durable Object (atomic, no
+  rate limit). Streaming chat token accounting added via SSE tee.
 
-Phase 4 (real login flow, streaming token accounting, Whisper
-time-based quota) is intentionally out of scope.
+Phase 5 (real login flow, Whisper time-based quota, per-org admin,
+billing) is intentionally out of scope.
 
 ## Architecture decisions (don't relitigate without asking)
 
-- **BYOK interpretation is option B (vendor-held key), not option A
-  (end-user-supplied key).** The company holds one OpenAI key
-  centrally in Cloudflare; end users never paste an OpenAI key into
-  the desktop app. Suggestions that route around this were ruled
-  out at kickoff.
+- **BYOK interpretation is option B (vendor-held key), not option A.**
+  Company holds one OpenAI key centrally in CF; end users never paste
+  one into the app.
 - **AI Gateway sits in front of OpenAI; the Worker sits in front of
   AI Gateway.** The OpenAI SDK on the client is kept as-is with a
   `baseURL` override.
-- **Phase boundaries are deliberate.** Don't bolt a real login
-  flow or streaming token accounting into Phase 3.
+- **Phase boundaries are deliberate.** Don't bolt a real login flow
+  into Phase 4.
 - **Authenticated Gateway is always on.** Every request from the
   Worker to AI Gateway carries `cf-aig-authorization`.
 - **Auth is opaque API keys, not JWTs.** Long-lived, server-issued,
-  revocable from KV without rotating any global secret. Matches the
-  OpenAI/Stripe pattern users already know. Don't reintroduce JWTs
-  for the primary auth path unless the requirements change.
+  revocable from KV. Don't reintroduce JWTs as the primary auth path.
+- **KV is for static identity + config. Durable Objects are for live
+  counters.** Don't move counters back into the KV record — that
+  reintroduces the 1 write/sec/key cap (see SCALING.md).
+- **Streaming chat must be counted.** Don't refactor the SSE tee
+  out of `src/worker/index.ts` without replacing it with another
+  mechanism (e.g. AI Gateway logs reconciliation).
 
 ## File map and conventions
 
-- `src/worker/users.ts` — KV store helpers. The single source of
-  truth for the user record shape (`User` type) and the KV layout:
-    - `apikey:<sha256-hex>` → User JSON (hot-path auth lookup)
-    - `sub:<sub>` → `<sha256-hex>` (admin lookup by username)
-  Hash uses Web Crypto SHA-256 only — runtime-agnostic. API keys
-  are `aigwk_` + 48 hex chars (24 random bytes). The plaintext key
-  is shown only at creation time; subsequent reads return the hash.
-- `src/worker/admin.ts` — `/admin/*` request handler. Reads
-  `x-admin-token` header, dispatches to `users.ts`.
+- `src/worker/users.ts` — KV-only. `UserRecord` is identity + config
+  (no counters). KV layout:
+    - `apikey:<sha256-hex>` → UserRecord JSON
+    - `sub:<sub>` → `<sha256-hex>`
+  API keys are `aigwk_` + 48 hex chars (24 random bytes). Plaintext
+  shown only at creation; storage holds the hash.
+- `src/worker/usage.ts` — `UsageCounter` (Durable Object class,
+  extends `DurableObject` from `cloudflare:workers`) + helpers
+  `getUsage` / `incrementUsageDO` / `resetUsageDO`. The DO accepts
+  fetch requests at `/get`, `/increment`, `/reset`. One DO per
+  `sub`, addressed by `env.USAGE.idFromName(sub)`.
+- `src/worker/admin.ts` — `/admin/*` handler. Reads
+  `x-admin-token`. Merges UserRecord (KV) with UsageState (DO) on
+  every response.
 - `src/worker/index.ts` — main fetch handler. Order of operations
   matters and is load-bearing:
     1. `/admin/*` short-circuits to admin handler.
     2. Validate `Authorization: Bearer <api_key>`.
-    3. Look up user; reject if missing / revoked / over budget.
-    4. If chat completions: parse JSON body once, enforce
-       `allowed_models`, then forward the buffered body.
-    5. For other endpoints (Whisper multipart, etc.), stream the
-       body through without parsing.
-    6. Forward to AI Gateway with `cf-aig-authorization`, no
+    3. Look up UserRecord in KV; reject if missing/revoked.
+    4. Read UsageState from DO; reject if budget exceeded.
+    5. If chat completions: parse JSON body, enforce
+       `allowed_models`, **inject `stream_options.include_usage`**
+       when stream=true, re-serialize.
+    6. For other endpoints, stream `request.body` through unread.
+    7. Forward to AI Gateway with `cf-aig-authorization`, no
        `Authorization`.
-    7. For non-streaming chat JSON responses: read body, extract
-       `usage.total_tokens`, `ctx.waitUntil(incrementUsage(...))`,
-       return the original body verbatim.
-    8. For streaming or non-JSON: pass through, no usage tracking.
-  Don't refactor this into "always read the response body" — that
-  breaks SSE.
+    8. If non-streaming JSON chat response: read body, extract
+       `usage.total_tokens`, `ctx.waitUntil(incrementUsageDO(...))`,
+       return original body.
+    9. If streaming chat: `body.tee()`; one branch streams to
+       client; the other parses SSE in `ctx.waitUntil` and calls
+       `incrementUsageDO` when the usage chunk is seen.
+    10. Otherwise (Whisper, etc): pass through, no usage tracking.
+  Don't refactor "always read response body" — breaks SSE.
 - `src/config.ts`, `src/client.ts`, `src/probe-*.ts` — probes are
-  mode-agnostic; `CF_WORKER_URL` switches between direct AI Gateway
-  and Worker. The probes' `USER_API_KEY` env var becomes the
-  `Authorization` bearer token in worker mode.
-- `scripts/admin.ts` — Node CLI that talks to the Worker's
-  `/admin/*` endpoints with `x-admin-token`. Reads `.dev.vars` for
-  local convenience.
-- `wrangler.toml` — declares the `USERS` KV namespace. Local
-  `wrangler dev` ignores the `id` value, but **before deploy you
-  must** run `wrangler kv namespace create USERS` and substitute
-  the printed id.
+  mode-agnostic. `CF_WORKER_URL` switches between direct AI Gateway
+  and the Worker. `USER_API_KEY` becomes the `Authorization` bearer
+  token in worker mode.
+- `scripts/admin.ts` — Node CLI talking to `/admin/*`. Reads
+  `.dev.vars` for local convenience.
+- `wrangler.toml` — declares `USERS` KV namespace, `USAGE` DO
+  binding, and a `[[migrations]]` entry for `UsageCounter`. Before
+  `wrangler deploy`, run `wrangler kv namespace create USERS` and
+  substitute the printed id.
 - `.dev.vars` — gitignored. Local-only Worker secrets.
 
 ES modules, strict TypeScript, no test framework yet. If tests get
@@ -98,64 +107,77 @@ added later, prefer `node --test` over a dependency.
 
 CF AI Gateway's Stored Keys feature substitutes the upstream
 provider key only when the client sends **no** `Authorization`
-header. If `Authorization` is present, the gateway forwards its
-value verbatim and never touches the stored key.
-
-In the Worker (`src/worker/index.ts`), the incoming `authorization`
-header (the user's API key) is **deleted** before forwarding to
-the gateway. Don't change that.
+header. In the Worker (`src/worker/index.ts`), the incoming
+`authorization` header (the user's API key) is **deleted** before
+forwarding. Don't change that. Also strip `content-length` for chat
+because we rewrote the body — let fetch recalculate.
 
 In direct mode (`src/client.ts`), the OpenAI SDK's auto-generated
-`Authorization` header is stripped by passing
-`Authorization: null` in `defaultHeaders` — the SDK's
-`applyHeadersMut` (`node_modules/openai/core.js` ~line 848) treats
-`null` as "delete this header." The CF gateway auth header
-(`cf-aig-authorization`) is always sent regardless.
+`Authorization` header is suppressed by `Authorization: null` in
+`defaultHeaders` — the SDK's `applyHeadersMut` treats null as
+"delete this header." `cf-aig-authorization` is always sent.
 
 ### 2. wrangler runtime lags the calendar
 
-`compatibility_date` in `wrangler.toml` must be a date the installed
-wrangler runtime supports. If you bump it ahead of the runtime's
-build date you get `"This Worker requires compatibility date X,
-but the newest date supported by this server binary is Y"`. Fix
-is to either upgrade wrangler or set a date the local binary
-actually knows. Currently pinned to `2026-04-28`.
+`compatibility_date` must be a date the installed wrangler runtime
+supports. Currently pinned to `2026-04-28`.
 
-### 3. KV id field is required even for local dev
+### 3. KV id is required even for local dev
 
 `wrangler dev` rejects a `kv_namespaces` entry without an `id`, but
-ignores the *value* for local — any non-empty placeholder works.
-The placeholder must be replaced with a real namespace id before
-`wrangler deploy`. See README for the create-namespace command.
+ignores the value for local — any non-empty placeholder works. Must
+be replaced before `wrangler deploy`.
 
-### 4. Usage tracking only covers non-streaming chat
+### 4. Durable Objects require Workers Paid + a migration entry
 
-The Worker can only parse `usage.total_tokens` from buffered
-JSON responses. Streaming responses (SSE) are passed through
-unread; Whisper has no token field. This is intentional in
-Phase 3 — fixing it requires either teeing the SSE stream and
-parsing the `[DONE]`-preceding chunk (with
-`stream_options.include_usage`), or relying on AI Gateway's own
-logging API. Both are Phase 4 work.
+The `[[migrations]]` block in `wrangler.toml` is what tells
+`wrangler deploy` to create the DO class. Without it, deploy fails.
+DO is not on the Free plan; running `wrangler deploy` without the
+paid plan will return an error.
+
+### 5. Streaming usage tracking depends on injection
+
+OpenAI streams `usage` only when the request opted in via
+`stream_options: { include_usage: true }`. The Worker injects this
+unconditionally for streaming chat (see `src/worker/index.ts`).
+Don't strip the injection. If the SDK ever sends its own
+`stream_options`, the Worker preserves them and just adds
+`include_usage`.
+
+### 6. Use `DurableObject` from `cloudflare:workers`, not a class shim
+
+The `UsageCounter` class extends `DurableObject<Env>` imported from
+`cloudflare:workers`. The older "plain class with state property"
+form fails the `@cloudflare/workers-types` `DurableObjectBranded`
+constraint. Don't downgrade to a plain class.
+
+### 7. SSE parsing is best-effort
+
+`parseSseUsage` in `src/worker/index.ts` reads the tee'd response
+branch and looks for a `data: { ... usage: { ... } }` chunk before
+`data: [DONE]`. If the upstream sends malformed chunks or the parse
+crashes, we drop usage for that request silently. Don't throw out
+of there — it shouldn't fail the user-facing response. Phase 5 can
+reconcile from AI Gateway logs.
 
 ## Environment quirks
 
-- The working directory exists at two paths that **share the same
-  inode** (`/ssd/devhome/work/github/cf-aigw-exp` and
-  `/home/timwu/work/github/cf-aigw-exp`). Prefer the `/ssd/...` path.
+- Working directory exists at two paths sharing the same inode
+  (`/ssd/devhome/work/github/cf-aigw-exp` and
+  `/home/timwu/work/github/cf-aigw-exp`). Prefer `/ssd/...`.
 - `CLOUDFLARE_API_TOKEN` in `.env` is reused as `CF_AIGW_TOKEN`
-  (the runtime gateway-auth header). That's PoC-only; a production
-  deployment should give the gateway-auth role only `AI Gateway:
-  Run` and store it via `wrangler secret put CF_AIGW_TOKEN`.
+  (the runtime gateway-auth header). PoC-only — production should
+  narrow it to `AI Gateway: Run` and store via
+  `wrangler secret put CF_AIGW_TOKEN`.
+- `.dev.vars` carries `CF_AIGW_TOKEN` and `ADMIN_TOKEN`. The admin
+  CLI reads `ADMIN_TOKEN` from there — convenient locally, but
+  whoever can read the repo on this host has admin access. In
+  production the operator runs `admin` from a shell with
+  `ADMIN_TOKEN` exported, not from `.dev.vars`.
 - `wrangler` and `cloudflared` are installed locally. `wrangler dev`
-  works without `wrangler login` so long as secrets are in
-  `.dev.vars`; deploy needs login.
-- `.dev.vars` carries both `CF_AIGW_TOKEN` and `ADMIN_TOKEN`. The
-  admin CLI reads `ADMIN_TOKEN` from there too, which is convenient
-  locally but means whoever can read the repo on this host has
-  admin access. In production the operator runs `admin` from a
-  shell where `ADMIN_TOKEN` is exported, not from a checked-out
-  `.dev.vars`.
+  works without `wrangler login`; deploy needs login.
+- Wiping `.wrangler/` clears local KV + DO state. Useful when
+  schema changes (e.g. the Phase 3 → Phase 4 User record shift).
 
 ## Working style for this user
 
@@ -165,4 +187,4 @@ logging API. Both are Phase 4 work.
   proposing a multi-phase plan, give Phase N concretely and just
   outline Phase N+1.
 - Terse responses. Code-level detail in code; narrative in
-  README/CLAUDE.md, not in chat output.
+  README/CLAUDE.md/SCALING.md, not in chat output.

@@ -8,14 +8,24 @@ compatibility_date = "2026-04-28"
 CF_ACCOUNT_ID = "15bfe332876061d9a548a4f3d6835657"
 CF_AIGW_ID = "aigw-exp-poc"
 
-# Workers KV namespace for per-user records.
-# Local dev (`wrangler dev`) uses a local KV store and ignores `id` content,
-# so any placeholder works locally. Before `wrangler deploy`, run:
-#     wrangler kv namespace create USERS
-# and replace the id below with the one wrangler prints.
+# Workers KV namespace for per-user identity + config.
+# Local dev (`wrangler dev`) ignores the `id` value, so any placeholder works.
+# Before `wrangler deploy`, run `wrangler kv namespace create USERS` and
+# replace the id below with the one wrangler prints.
 [[kv_namespaces]]
 binding = "USERS"
 id = "PLACEHOLDER_REPLACE_BEFORE_DEPLOY"
+
+# Durable Object: per-user atomic usage counter. See src/worker/usage.ts and
+# SCALING.md for why this replaces the KV-stored counter from Phase 3.
+# Requires Workers Paid plan.
+[[durable_objects.bindings]]
+name = "USAGE"
+class_name = "UsageCounter"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["UsageCounter"]
 
 [dev]
 port = 8787

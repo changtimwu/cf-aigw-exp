@@ -3,10 +3,11 @@ import {
   createUser,
   getUserBySub,
   listUsers,
-  resetUsage,
   revokeUser,
   HttpError,
+  type UserRecord,
 } from "./users.js";
+import { getUsage, resetUsageDO, type UsageState } from "./usage.js";
 
 // Admin endpoints. All require `x-admin-token: <ADMIN_TOKEN>`. Routes:
 //   POST   /admin/users                  body: { sub, allowed_models?, token_budget? }
@@ -15,9 +16,9 @@ import {
 //   DELETE /admin/users/:sub             marks revoked=true (does not erase)
 //   POST   /admin/users/:sub/reset-usage
 //
-// The admin surface lives on the same Worker as the public API; in
-// production these would ideally be on a separate Worker with IP/mTLS
-// gating. Noted as a Phase-3 gap.
+// Responses combine the KV record with live usage from the per-user
+// Durable Object so the operator sees a single coherent view.
+
 export async function handleAdmin(request: Request, env: Env): Promise<Response> {
   const supplied = request.headers.get("x-admin-token");
   if (!supplied || supplied !== env.ADMIN_TOKEN) {
@@ -52,6 +53,10 @@ export async function handleAdmin(request: Request, env: Env): Promise<Response>
   }
 }
 
+function merge(record: UserRecord, usage: UsageState) {
+  return { ...record, ...usage };
+}
+
 async function postUsers(request: Request, env: Env): Promise<Response> {
   let body: { sub?: string; allowed_models?: string[]; token_budget?: number };
   try {
@@ -67,30 +72,37 @@ async function postUsers(request: Request, env: Env): Promise<Response> {
     allowed_models: body.allowed_models,
     token_budget: body.token_budget,
   });
-  return json(201, out);
+  const usage = await getUsage(env, out.user.sub);
+  return json(201, { user: merge(out.user, usage), api_key: out.api_key });
 }
 
 async function getUsers(env: Env): Promise<Response> {
-  const users = await listUsers(env);
+  const records = await listUsers(env);
+  const users = await Promise.all(
+    records.map(async (r) => merge(r, await getUsage(env, r.sub))),
+  );
   return json(200, { users });
 }
 
 async function getOne(env: Env, sub: string): Promise<Response> {
-  const user = await getUserBySub(env, sub);
-  if (!user) return jsonError(404, "user_not_found");
-  return json(200, { user });
+  const record = await getUserBySub(env, sub);
+  if (!record) return jsonError(404, "user_not_found");
+  const usage = await getUsage(env, sub);
+  return json(200, { user: merge(record, usage) });
 }
 
 async function revoke(env: Env, sub: string): Promise<Response> {
-  const user = await revokeUser(env, sub);
-  if (!user) return jsonError(404, "user_not_found");
-  return json(200, { user });
+  const record = await revokeUser(env, sub);
+  if (!record) return jsonError(404, "user_not_found");
+  const usage = await getUsage(env, sub);
+  return json(200, { user: merge(record, usage) });
 }
 
 async function reset(env: Env, sub: string): Promise<Response> {
-  const user = await resetUsage(env, sub);
-  if (!user) return jsonError(404, "user_not_found");
-  return json(200, { user });
+  const record = await getUserBySub(env, sub);
+  if (!record) return jsonError(404, "user_not_found");
+  const usage = await resetUsageDO(env, sub);
+  return json(200, { user: merge(record, usage) });
 }
 
 function json(status: number, body: unknown): Response {

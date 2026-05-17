@@ -1,15 +1,14 @@
 import type { Env } from "./env.js";
 import { handleAdmin } from "./admin.js";
-import {
-  getUserByApiKey,
-  hashApiKey,
-  incrementUsage,
-  type User,
-} from "./users.js";
+import { getUserByApiKey, type UserRecord } from "./users.js";
+import { getUsage, incrementUsageDO } from "./usage.js";
 
-// Phase 3 Worker: per-user API key auth backed by Workers KV, plus admin
-// endpoints. Forwards approved requests to CF AI Gateway and tracks usage
-// for non-streaming chat completions.
+export { UsageCounter } from "./usage.js";
+
+// Phase 4 Worker: per-user API key auth (KV) + atomic per-user usage
+// counters (Durable Objects). Tracks token usage for both non-streaming
+// and streaming chat completions. Forwards approved requests to CF AI
+// Gateway with BYOK substitution.
 //
 // Incoming public traffic:  POST <worker>/chat/completions, /audio/transcriptions, etc.
 //                           Authorization: Bearer <user-api-key>
@@ -38,27 +37,43 @@ export default {
     const user = await getUserByApiKey(env, apiKey);
     if (!user) return jsonError(401, "invalid_api_key");
     if (user.revoked) return jsonError(403, "user_revoked");
-    if (user.token_budget > 0 && user.tokens_used >= user.token_budget) {
-      return jsonError(429, "budget_exceeded");
+
+    // Budget check uses the Durable Object — atomic, not subject to
+    // KV's 1-write/sec/key cap. See SCALING.md for context.
+    if (user.token_budget > 0) {
+      const usage = await getUsage(env, user.sub);
+      if (usage.tokens_used >= user.token_budget) {
+        return jsonError(429, "budget_exceeded");
+      }
     }
 
-    // --- model allow-list (chat completions only — Whisper sends multipart) ---
+    // --- request body shaping ---
+    // For chat completions: parse to enforce allow-list AND inject
+    // `stream_options.include_usage` so streaming responses emit a
+    // final usage chunk we can parse.
+    // Other endpoints (Whisper multipart): stream the body through.
     let forwardBody: BodyInit | null = null;
+    let isStreamingChat = false;
     if (request.method !== "GET" && request.method !== "HEAD") {
       if (url.pathname === "/chat/completions") {
         const text = await request.text();
+        let parsed: { model?: string; stream?: boolean; stream_options?: { include_usage?: boolean } };
         try {
-          const parsed = JSON.parse(text) as { model?: string };
-          if (
-            user.allowed_models.length > 0 &&
-            (!parsed.model || !user.allowed_models.includes(parsed.model))
-          ) {
-            return jsonError(403, "model_not_allowed");
-          }
+          parsed = JSON.parse(text);
         } catch {
           return jsonError(400, "invalid_json");
         }
-        forwardBody = text;
+        if (
+          user.allowed_models.length > 0 &&
+          (!parsed.model || !user.allowed_models.includes(parsed.model))
+        ) {
+          return jsonError(403, "model_not_allowed");
+        }
+        if (parsed.stream === true) {
+          isStreamingChat = true;
+          parsed.stream_options = { ...(parsed.stream_options ?? {}), include_usage: true };
+        }
+        forwardBody = JSON.stringify(parsed);
       } else {
         forwardBody = request.body;
       }
@@ -72,6 +87,9 @@ export default {
     fwdHeaders.delete("authorization");
     fwdHeaders.delete("host");
     fwdHeaders.delete("cookie");
+    // The OpenAI SDK may have set content-length for the original body;
+    // we rewrote chat bodies so let fetch recalculate.
+    if (url.pathname === "/chat/completions") fwdHeaders.delete("content-length");
     fwdHeaders.set("cf-aig-authorization", `Bearer ${env.CF_AIGW_TOKEN}`);
     fwdHeaders.set("cf-aig-metadata", JSON.stringify({ user: user.sub }));
 
@@ -81,13 +99,20 @@ export default {
       body: forwardBody,
     });
 
-    // --- usage tracking (non-streaming chat only) ---
-    // Streaming responses pass through unread so SSE keeps streaming; tokens
-    // for those requests are not counted yet (Phase 3 gap).
-    const isStream =
-      (upstreamRes.headers.get("content-type") ?? "").includes("event-stream");
+    // --- response: usage tracking + pass-through ---
+    if (isStreamingChat && upstreamRes.body && upstreamRes.ok) {
+      // Tee: one branch streams to the client, the other parses SSE
+      // server-side for the usage chunk.
+      const [clientBranch, parseBranch] = upstreamRes.body.tee();
+      ctx.waitUntil(parseSseUsage(parseBranch, env, user));
+      return new Response(clientBranch, {
+        status: upstreamRes.status,
+        statusText: upstreamRes.statusText,
+        headers: responseHeaders(upstreamRes.headers, user),
+      });
+    }
+
     if (
-      !isStream &&
       url.pathname === "/chat/completions" &&
       upstreamRes.ok &&
       (upstreamRes.headers.get("content-type") ?? "").includes("application/json")
@@ -97,38 +122,72 @@ export default {
         const parsed = JSON.parse(buf) as { usage?: { total_tokens?: number } };
         const used = parsed.usage?.total_tokens ?? 0;
         if (used > 0) {
-          ctx.waitUntil(incrementUsageBg(env, user, apiKey, used));
+          ctx.waitUntil(incrementUsageDO(env, user.sub, used));
         }
       } catch {
-        // Don't fail the whole request just because usage parsing failed.
+        // Don't fail the request because usage parsing failed.
       }
-      const resHeaders = withCors(upstreamRes.headers);
-      resHeaders.set("x-user", user.sub);
       return new Response(buf, {
         status: upstreamRes.status,
         statusText: upstreamRes.statusText,
-        headers: resHeaders,
+        headers: responseHeaders(upstreamRes.headers, user),
       });
     }
 
-    const resHeaders = withCors(upstreamRes.headers);
-    resHeaders.set("x-user", user.sub);
     return new Response(upstreamRes.body, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
-      headers: resHeaders,
+      headers: responseHeaders(upstreamRes.headers, user),
     });
   },
 } satisfies ExportedHandler<Env>;
 
-async function incrementUsageBg(env: Env, user: User, apiKey: string, addedTokens: number) {
-  const hash = await hashApiKey(apiKey);
-  await incrementUsage(env, user, hash, addedTokens);
+// Parse an OpenAI SSE stream looking for the final chunk that carries
+// `usage`. Emitted by OpenAI when the request had
+// `stream_options.include_usage: true` (we inject this above).
+async function parseSseUsage(stream: ReadableStream, env: Env, user: UserRecord): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n\n")) >= 0) {
+        const event = buf.slice(0, nl);
+        buf = buf.slice(nl + 2);
+        const line = event.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const j = JSON.parse(data) as { usage?: { total_tokens?: number } };
+          const used = j.usage?.total_tokens ?? 0;
+          if (used > 0) {
+            await incrementUsageDO(env, user.sub, used);
+          }
+        } catch {
+          // Ignore malformed lines; keep reading.
+        }
+      }
+    }
+  } catch {
+    // Stream errors don't fail the request; usage just doesn't get counted.
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // ignore
+    }
+  }
 }
 
-function withCors(src: Headers): Headers {
+function responseHeaders(src: Headers, user: UserRecord): Headers {
   const h = new Headers(src);
   for (const [k, v] of Object.entries(corsHeaders())) h.set(k, v);
+  h.set("x-user", user.sub);
   return h;
 }
 
