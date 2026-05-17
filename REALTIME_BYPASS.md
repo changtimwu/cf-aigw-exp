@@ -94,6 +94,52 @@ In security terms, the attack surface for the *customer-facing*
 risk is unchanged. We've added one more thing to rotate when we
 rotate the OpenAI key — that's the entire delta.
 
+## This split is a well-known pattern, not an oddity
+
+The hybrid we end up with — control/auth/admin going through one
+centralized layer (the Worker's user store + AI Gateway), the
+high-bandwidth streaming audio flowing on a separate, more direct
+path — has a standard name in distributed-systems design:
+**separation of control plane and data plane**. Real-world systems
+your team uses every day are built this way:
+
+- **Zoom / WebRTC video calls.** The signaling server (centralized)
+  negotiates the call: who joins, which codec, authentication.
+  Once the call is up, audio and video flow directly between
+  participants (or through a media relay that is a *separate
+  service* from the signaling layer). Nobody designs WebRTC with
+  the video frames also going through the signaling server.
+- **BitTorrent.** The tracker is centralized — it knows who has
+  which pieces and brokers peer discovery. The actual file blocks
+  travel peer-to-peer, not through the tracker.
+- **Telephony (SIP/IMS).** Signaling lives on a SIP server; the
+  voice (RTP) flows directly between endpoints (or through a
+  media gateway that's distinct from the SIP server).
+- **Cloudflare's own products.** Their Tunnel / WARP product has
+  a control plane (auth, routing decisions) separate from the
+  data plane (the actual customer traffic). They build their own
+  systems this way because it's the right shape.
+
+The reason all these systems split is the same reason ours splits:
+**a centralized layer is great at low-volume control decisions —
+auth, billing, audit, policy — but it's a poor fit as a forced
+hop for high-volume streaming data**. Cloudflare AI Gateway is
+exactly the right place for request-by-request audit and cost
+tracking of REST calls (which are sparse and discrete). It's a
+debatable place for every audio frame of every customer voice
+session to pass through, even if it worked.
+
+So when Cloudflare ships a fix for their WS proxy, we *can* route
+realtime back through the gateway to get the unified
+billing/audit view — and the plan is to do exactly that — but the
+architecture we ship today is **not** an embarrassing workaround
+that we're hiding from. It's a textbook division of concerns that
+other production systems arrive at independently. The "workaround"
+framing is true at the level of motivation (we did this because
+the gateway broke); the "intentional design" framing is true at
+the level of architecture (this is what mature streaming systems
+look like).
+
 ## What we actually lose
 
 To be straight about the costs:
@@ -153,5 +199,5 @@ The likely objections and the short responses:
 | ---------------------------------------------------- | ------------------------------------------------------------ |
 | "Why are we storing the OpenAI key twice?"           | Same string, two Cloudflare-managed locations. Both invisible to customers. The redundancy is the cost of working around the gateway regression. |
 | "Won't this skew our cost accounting?"               | No. The per-user counter and OpenAI's bill are both source-of-truth. AI Gateway logs are nice-to-have; OpenAI's bill is authoritative. |
-| "What if Cloudflare never fixes it?"                 | We stay on the bypass. The bypass is a complete solution on its own — it's not a fragile workaround that needs the gateway to come back. |
+| "What if Cloudflare never fixes it?"                 | We stay on the bypass. It's a complete solution on its own and matches how Zoom, BitTorrent, and SIP-based telephony split control vs data planes. Not a fragile workaround. |
 | "Could we self-host the gateway logic in the Worker?" | Yes — for realtime specifically, the Worker is already in the data path, so adding session logging there is a small extension of Phase 5b's metering work. We do it if Cloudflare drags. |
