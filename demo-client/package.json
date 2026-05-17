@@ -1,0 +1,25 @@
+{
+  "name": "cf-aigw-exp-demo-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference client showing how to migrate from OpenAI direct to the cf-aigw-exp Worker.",
+  "type": "module",
+  "scripts": {
+    "demo:chat": "tsx demo-chat.ts",
+    "demo:stream": "tsx demo-stream.ts",
+    "demo:whisper": "tsx demo-whisper.ts",
+    "demo:realtime": "tsx demo-realtime.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.73.0",
+    "ws": "^8.20.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

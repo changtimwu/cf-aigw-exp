@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.log
+*.pcm
+*.wav
+*.mp3
+*.m4a
+# Ship these sample files so `npm run demo:*` works out of the box.
+!hello-24k.pcm
+!hello.wav
