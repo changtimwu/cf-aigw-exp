@@ -13,13 +13,13 @@ function optional(name: string): string | undefined {
 
 // The probes have two backends:
 //  - direct: hit CF AI Gateway with cf-aig-authorization (Phase 1)
-//  - worker: hit our Cloudflare Worker with a per-user JWT (Phase 2)
+//  - worker: hit our Cloudflare Worker with a per-user API key (Phase 3)
 //
-// Setting CF_WORKER_URL switches to worker mode. Setting USER_JWT supplies
-// the per-user token; you can mint one with `npm run issue:token -- --sub <user>`.
+// Setting CF_WORKER_URL switches to worker mode. Setting USER_API_KEY supplies
+// the per-user token; mint one with `npm run admin -- create-user --sub <user>`.
 export type Mode =
   | { kind: "direct"; openaiBaseURL: string; gatewayToken: string; openaiKey?: string }
-  | { kind: "worker"; openaiBaseURL: string; userJwt: string; openaiKey?: string };
+  | { kind: "worker"; openaiBaseURL: string; userApiKey: string; openaiKey?: string };
 
 const accountId = required("CF_ACCOUNT_ID");
 const workerUrl = optional("CF_WORKER_URL");
@@ -31,7 +31,7 @@ export const mode: Mode = (() => {
     return {
       kind: "worker",
       openaiBaseURL: workerUrl.replace(/\/$/, ""),
-      userJwt: required("USER_JWT"),
+      userApiKey: required("USER_API_KEY"),
       openaiKey,
     };
   }

@@ -12,5 +12,5 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"]
   },
-  "include": ["src/jwt.ts", "src/worker/**/*.ts"]
+  "include": ["src/worker/**/*.ts"]
 }

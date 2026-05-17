@@ -5,5 +5,11 @@ export interface Env {
 
   // Secrets (set via `wrangler secret put` for prod, .dev.vars for local).
   CF_AIGW_TOKEN: string;
-  JWT_SECRET: string;
+  ADMIN_TOKEN: string;
+
+  // KV namespace holding per-user records.
+  // Layout:
+  //   apikey:<sha256-hex>  → User JSON  (hot path; auth lookup)
+  //   sub:<sub>            → <sha256-hex> (admin lookup by username)
+  USERS: KVNamespace;
 }

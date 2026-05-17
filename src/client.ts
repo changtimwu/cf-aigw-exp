@@ -11,14 +11,15 @@ import { mode } from "./config.js";
 //      * Always send `cf-aig-authorization`.
 //
 //  - mode.kind === "worker": hit our Cloudflare Worker.
-//      * `Authorization: Bearer <user-jwt>` — validated by the Worker.
+//      * `Authorization: Bearer <user-api-key>` — validated against KV by
+//        the Worker, which enforces revoke/budget/model allow-list.
 //      * No `cf-aig-authorization` from us; the Worker holds the gateway
 //        token server-side and injects it on the upstream hop.
 const byok = mode.kind === "direct" && !mode.openaiKey;
 
 const apiKey =
   mode.kind === "worker"
-    ? mode.userJwt
+    ? mode.userApiKey
     : (mode.openaiKey ?? "sk-byok-placeholder");
 
 const defaultHeaders: Record<string, string | null> = {};
@@ -35,7 +36,7 @@ export const openai = new OpenAI({
 
 export function describeMode(): string {
   if (mode.kind === "worker") {
-    return "via Cloudflare Worker (per-user JWT; Worker holds the gateway token)";
+    return "via Cloudflare Worker (per-user API key; Worker enforces auth/quota/allow-list)";
   }
   return byok
     ? "direct → AI Gateway (BYOK; Authorization stripped, stored key substituted)"

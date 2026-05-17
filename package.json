@@ -1,6 +1,6 @@
 {
   "name": "cf-aigw-exp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "PoC: route OpenAI traffic through Cloudflare AI Gateway with vendor-held key (BYOK option B).",
   "type": "module",
@@ -9,7 +9,7 @@
     "probe:stream": "tsx src/probe-stream.ts",
     "probe:whisper": "tsx src/probe-whisper.ts",
     "probe:all": "npm run probe:chat && npm run probe:stream && npm run probe:whisper",
-    "issue:token": "tsx scripts/issue-token.ts",
+    "admin": "tsx scripts/admin.ts",
     "worker:dev": "wrangler dev",
     "worker:deploy": "wrangler deploy",
     "worker:typecheck": "tsc -p tsconfig.worker.json --noEmit",

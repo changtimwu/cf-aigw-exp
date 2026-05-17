@@ -1,12 +1,12 @@
 # cf-aigw-exp
 
-**Status:** Phase 2 (Worker auth in front of AI Gateway) — experimental, not for production use.
+**Status:** Phase 3 (per-user API keys + quota in front of AI Gateway) — experimental, not for production use.
 
 A proof-of-concept for routing an internal OpenAI-powered desktop app's
 traffic through [Cloudflare AI Gateway][cfaigw] as it transitions from
 in-house tool to commercial product. The driving requirement: stop
-embedding a fixed OpenAI key in every shipped binary, and let one
-central server hold the OpenAI key for all users.
+embedding a fixed OpenAI key in every shipped binary, and centrally
+control who can use the service, with what budget, and for which models.
 
 [cfaigw]: https://www.cloudflare.com/products/ai-gateway/
 
@@ -18,133 +18,142 @@ single embedded key is no longer viable — it can be extracted, abused,
 or starve real users. The decision was to keep the OpenAI relationship
 **centralized at the vendor (us)** rather than asking each customer to
 bring their own OpenAI account. Cloudflare AI Gateway is the proxy
-layer; a thin Cloudflare Worker in front of it adds per-user auth.
+layer; a Cloudflare Worker in front of it adds per-user auth, quotas,
+and model allow-listing.
 
-## Architecture (Phase 2 — implemented)
+## Architecture (Phase 3 — implemented)
 
 ```
-┌──────────────┐    Bearer JWT     ┌─────────────────┐    cf-aig-auth    ┌──────────────┐    upstream    ┌────────┐
-│ desktop app  │ ────────────────▶ │ Cloudflare      │ ────────────────▶ │ Cloudflare   │ ─────────────▶ │ OpenAI │
-│ (per user)   │  (HS256, user_id) │ Worker          │   gateway token   │ AI Gateway   │  stored key    └────────┘
-└──────────────┘                   │ (this repo)     │                   │ (BYOK)       │
-                                   └─────────────────┘                   └──────────────┘
-                                       │   ▲
-                                       │   └─ holds gateway token (Worker secret)
-                                       └────  validates HS256 JWT (Worker secret)
+┌──────────────┐   Bearer aigwk_…   ┌──────────────────────┐   cf-aig-auth   ┌──────────────┐   upstream    ┌────────┐
+│ desktop app  │ ──────────────────▶│ Cloudflare Worker    │ ───────────────▶│ Cloudflare   │ ─────────────▶│ OpenAI │
+│ (per user)   │  per-user API key  │ (this repo)          │  gateway token  │ AI Gateway   │  stored key   └────────┘
+└──────────────┘                    │   • auth (KV)        │                 │ (BYOK)       │
+                                    │   • model allow-list │                 └──────────────┘
+                                    │   • token budget     │
+                                    │   • usage tracking   │
+                                    └──────────────────────┘
+                                              │
+                                              └─ /admin/* (x-admin-token) for
+                                                 provisioning + revocation
 ```
 
-Phase 1 (direct probe → AI Gateway) is still supported by the same
-probes — set `CF_WORKER_URL` to enable Phase 2 routing, leave it
-empty for Phase 1.
+Phase 1 (direct probe → AI Gateway) is still supported as a diagnostic
+path — set `CF_WORKER_URL` to enable Phase 3 routing, leave it empty
+for the direct mode.
 
 ## Roadmap
 
-| Phase | Scope                                                                                          | This repo                    |
+| Phase | Scope                                                                                          | Status                       |
 | ----- | ---------------------------------------------------------------------------------------------- | ---------------------------- |
 | 1     | Validate the proxy path. Chat, streaming chat, Whisper all work through AI Gateway BYOK.        | done                         |
-| **2** | Cloudflare Worker for per-user JWT auth. App carries a per-user token, not the gateway token.   | ← we are here                |
-| 3     | Real user accounts (D1 / KV), login flow, per-user usage analytics, quota enforcement, model    | not yet                      |
-|       | allow-listing, key revocation.                                                                 |                              |
+| 2     | Cloudflare Worker for per-user JWT auth. App carries a per-user token, not the gateway token.   | done (now superseded)        |
+| **3** | KV-backed user store, opaque API keys, model allow-list, token budget, revocation, admin CLI.   | ← we are here                |
+| 4     | Login flow (signup, password/OAuth), streaming token accounting, Whisper time-based quota,      | not yet                      |
+|       | per-org admin separation, billing integration.                                                  |                              |
 
 ## Quick start
 
 ### Prerequisites
 
 - Node.js ≥ 20
-- `wrangler` installed (`npm i -g wrangler` or via your package manager)
-- A Cloudflare account (Account ID is filled into `.env.example`)
-- An OpenAI key with `gpt-4o-mini` + `whisper-1` access
+- `wrangler` installed and `wrangler login` run (only needed to deploy)
+- A Cloudflare account (Account ID is in `.env.example`)
+- An OpenAI key with `gpt-4o-mini` + `whisper-1` access, stored as a
+  Provider Key inside your AI Gateway (BYOK setup — see Phase 1 doc)
 
-### 1. One-time AI Gateway setup (dashboard)
-
-Same as Phase 1 — see [Phase 1 quick-start](#phase-1-direct-to-ai-gateway-still-supported).
-
-Create gateway `aigw-exp-poc`, enable Authenticated Gateway, store
-your OpenAI key in Provider Keys (BYOK).
-
-### 2. Phase 2: run the Worker locally
+### 1. Local end-to-end loop
 
 ```bash
 npm install
-cp .env.example .env             # fill in CF_AIGW_TOKEN etc as in Phase 1
-# Edit .dev.vars and replace JWT_SECRET with a real random string
-npm run worker:dev               # starts wrangler dev on http://localhost:8787
+
+# .env: set the direct-mode vars first (CF_AIGW_TOKEN, etc — same as Phase 1)
+cp .env.example .env
+
+# .dev.vars: replace the placeholder ADMIN_TOKEN with a real random string.
+# The CF_AIGW_TOKEN there is what the Worker uses server-side.
+
+npm run worker:dev          # starts wrangler dev on http://localhost:8787 with local KV
 
 # In another shell:
 export CF_WORKER_URL=http://localhost:8787
-export USER_JWT=$(npm run --silent issue:token -- --sub alice --ttl 24h)
-npm run probe:chat
-npm run probe:stream
-npm run probe:whisper
+
+# Provision a user; the response includes the api_key (shown ONCE).
+npm run admin -- create-user --sub alice --models gpt-4o-mini,whisper-1 --budget 50000
+# → { user: {...}, api_key: "aigwk_…" }
+
+export USER_API_KEY=aigwk_…          # paste from above
+
+npm run probe:chat                   # runs through the Worker; usage is tracked
+npm run probe:stream                 # streaming chat (token usage NOT tracked, see gaps below)
+npm run probe:whisper                # Whisper transcription (token usage not tracked — Whisper has no token count)
+
+npm run admin -- get-user --sub alice    # see tokens_used update after each chat
+npm run admin -- list-users
+npm run admin -- reset-usage --sub alice
+npm run admin -- revoke-user --sub alice # subsequent calls return 403 user_revoked
 ```
 
-When `CF_WORKER_URL` is set, the probes use it as the OpenAI
-`baseURL` and send `Authorization: Bearer $USER_JWT`. The Worker
-validates the JWT, strips that header, attaches
-`cf-aig-authorization` from its own secret, and forwards to AI
-Gateway. The desktop client never sees the gateway token or the
-OpenAI key.
-
-### Deploy to Cloudflare (optional)
+### 2. Deploy to Cloudflare
 
 ```bash
-wrangler login                                # one-time
-wrangler secret put CF_AIGW_TOKEN < /dev/tty  # paste your CF_AIGW_TOKEN
-wrangler secret put JWT_SECRET < /dev/tty     # paste a fresh random secret
-npm run worker:deploy
-# wrangler will print the public Worker URL — use that as CF_WORKER_URL
+wrangler login                                              # one-time
+wrangler kv namespace create USERS                          # prints an id
+# Edit wrangler.toml — replace the placeholder id with the printed one
+
+wrangler secret put CF_AIGW_TOKEN < /dev/tty                # paste your CF gateway token
+wrangler secret put ADMIN_TOKEN  < /dev/tty                 # paste a fresh random secret
+
+npm run worker:deploy                                       # prints the Worker URL
+
+# From any host (with ADMIN_TOKEN exported):
+export CF_WORKER_URL=https://cf-aigw-exp-worker.<subdomain>.workers.dev
+export ADMIN_TOKEN=…
+npm run admin -- create-user --sub <user>
 ```
 
-After deploy, your desktop app needs only:
-- The Worker URL (public — no secret)
-- A per-user JWT (issued by your auth system after login)
+After deploy, the desktop app needs only:
+- The Worker URL (public — not a secret)
+- A per-user API key (provisioned via `admin -- create-user`)
 
-It no longer needs `CF_AIGW_TOKEN`, no `OPENAI_API_KEY`, no
+It does not need `CF_AIGW_TOKEN`, `OPENAI_API_KEY`, `ADMIN_TOKEN`, or
 `CLOUDFLARE_API_TOKEN`.
 
-### Phase 1: direct-to-AI-Gateway (still supported)
+## Admin endpoints
+
+All require `x-admin-token: <ADMIN_TOKEN>`.
+
+| Method  | Path                              | Body                                          | Notes                                  |
+| ------- | --------------------------------- | --------------------------------------------- | -------------------------------------- |
+| POST    | `/admin/users`                    | `{ sub, allowed_models?, token_budget? }`     | Returns user + the api_key (shown once)|
+| GET     | `/admin/users`                    | —                                             | Lists all users                        |
+| GET     | `/admin/users/:sub`               | —                                             | One user                               |
+| DELETE  | `/admin/users/:sub`               | —                                             | Marks revoked=true (key invalidated)   |
+| POST    | `/admin/users/:sub/reset-usage`   | —                                             | Sets tokens_used=0                     |
+
+Defaults on create: `allowed_models=["gpt-4o-mini","whisper-1"]`,
+`token_budget=100000`. An empty `allowed_models` array means
+unrestricted; `token_budget=0` means unlimited.
+
+## Direct-to-AI-Gateway (still supported)
 
 Useful for diagnosing whether a problem is in the gateway or in the
-Worker. Leave `CF_WORKER_URL` empty in `.env`; the probes go straight
-to AI Gateway with `cf-aig-authorization`:
+Worker. Leave `CF_WORKER_URL` empty; the probes go straight to
+AI Gateway with `cf-aig-authorization`:
 
 ```bash
 unset CF_WORKER_URL
 npm run probe:chat
 ```
 
-See [Two operating modes](#two-operating-modes) for the direct-mode
-sub-options.
-
-## Two operating modes (direct only)
-
-When running Phase 1 (no Worker), the probes can use either of two
-direct-mode setups:
+Two sub-modes for direct (controlled by `OPENAI_API_KEY` in `.env`):
 
 | Mode             | `OPENAI_API_KEY` | Who holds the OpenAI key | Notes                                                |
 | ---------------- | ---------------- | ------------------------ | ---------------------------------------------------- |
 | **BYOK**         | *empty*          | Cloudflare (stored key)  | The intended setup.                                  |
 | Pass-through     | `sk-...` (real)  | the probe / app          | Fallback when BYOK isn't available, or for debugging |
 
-In Phase 2 (Worker), the question goes away: the Worker always uses
-BYOK against the gateway. The probes' `OPENAI_API_KEY` is irrelevant.
-
-## Issuing JWTs
-
-`scripts/issue-token.ts` mints an HS256 token signed with `JWT_SECRET`
-from `.dev.vars` (or the `JWT_SECRET` env var):
-
-```bash
-npm run issue:token -- --sub alice --ttl 24h
-# prints the JWT to stdout
-```
-
-`--sub` is the per-user identifier (free-form). `--ttl` accepts
-`Ns`, `Nm`, `Nh`, `Nd`. The Worker logs the `sub` into AI Gateway
-metadata so requests are attributable per user.
-
-In production, JWT issuance moves wherever your real auth system
-lives (this script is just for local testing).
+In Worker mode, the question goes away: the Worker always uses BYOK
+against the gateway.
 
 ## Layout
 
@@ -152,41 +161,54 @@ lives (this script is just for local testing).
 .
 ├── README.md
 ├── CLAUDE.md
-├── wrangler.toml                ← Worker config
-├── tsconfig.json                ← Node side (probes + scripts)
-├── tsconfig.worker.json         ← Workers runtime (Worker + shared jwt.ts)
-├── .env.example
+├── wrangler.toml                ← Worker config + KV binding
+├── tsconfig.json                ← Node side (probes + admin CLI)
+├── tsconfig.worker.json         ← Workers runtime side
+├── .env.example                 ← probes' env template
 ├── .dev.vars                    ← local Worker secrets (gitignored)
 ├── package.json
 ├── src/
-│   ├── jwt.ts                   ← HS256 sign/verify, runtime-agnostic
 │   ├── config.ts                ← probes' env reader; picks direct/worker
 │   ├── client.ts                ← OpenAI client wired to either backend
 │   ├── probe-chat.ts
 │   ├── probe-stream.ts
 │   ├── probe-whisper.ts
 │   └── worker/
-│       ├── index.ts             ← Worker entrypoint (auth + proxy)
-│       └── env.ts               ← Env binding types
+│       ├── index.ts             ← Worker entrypoint (auth + proxy + usage)
+│       ├── admin.ts             ← /admin/* handlers
+│       ├── users.ts             ← KV store helpers; opaque api_key model
+│       └── env.ts               ← Env bindings (KV + secrets)
 ├── scripts/
-│   └── issue-token.ts           ← CLI to mint per-user JWTs
+│   └── admin.ts                 ← CLI client for /admin/* endpoints
 └── samples/                     ← Whisper audio inputs (gitignored)
 ```
 
-## What Phase 2 still does NOT do
+## Phase 3 known gaps
 
-- **No persistent user store.** Tokens are signed with a shared
-  symmetric secret; revoking a single user means rotating the secret
-  (which invalidates everyone). Phase 3 adds D1/KV for per-user keys
-  and revocation.
-- **No per-user quotas.** AI Gateway's per-gateway rate-limits work,
-  but the Worker doesn't enforce per-`sub` request or token budgets
-  yet.
-- **No login flow / token refresh.** `issue:token` is a manual mint.
-- **No model allow-listing.** A user JWT can request any model the
-  gateway permits.
-
-These belong to Phase 3.
+- **Streaming token accounting.** Streaming chat (`stream: true`)
+  passes through unread to keep SSE flowing; tokens for those
+  requests are not counted in `tokens_used`. Workaround: require
+  `stream_options.include_usage` and parse the final chunk —
+  deferred to Phase 4.
+- **Whisper quota.** Whisper has no token count, so it doesn't
+  consume budget. A real product would count audio seconds (the
+  response doesn't carry it; would need to inspect upload size or
+  AI Gateway's logs). Deferred.
+- **No login flow.** API keys are provisioned by an operator
+  running `admin -- create-user`. There is no signup, password,
+  OAuth, or token refresh. A real product needs that layer; this
+  PoC assumes keys arrive out-of-band (like OpenAI's own model).
+- **Admin endpoints share the Worker.** Same Worker serves public
+  and admin traffic, gated by `x-admin-token`. Production would
+  ideally put admin on a separate Worker with IP/mTLS gating.
+- **KV write rate.** Workers KV is rate-limited to ~1 write/sec
+  per key. Per-user usage updates use the user's KV entry as the
+  write target; very high traffic from one user would lag.
+  Production would move counters to Durable Objects.
+- **No secret rotation flow.** Rotating `ADMIN_TOKEN` or
+  `CF_AIGW_TOKEN` requires `wrangler secret put` and a redeploy.
+  Rotating a user's API key requires revoking + creating a new
+  user (or extending the admin endpoints — easy follow-up).
 
 ## License
 
