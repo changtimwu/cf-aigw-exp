@@ -1,0 +1,13 @@
+name = "cf-aigw-exp-worker"
+main = "src/worker/index.ts"
+compatibility_date = "2026-04-28"
+
+# Non-secret config. Secrets (CF_AIGW_TOKEN, JWT_SECRET) live in .dev.vars
+# for local development and `wrangler secret put` for production.
+[vars]
+CF_ACCOUNT_ID = "15bfe332876061d9a548a4f3d6835657"
+CF_AIGW_ID = "aigw-exp-poc"
+
+[dev]
+port = 8787
+local_protocol = "http"

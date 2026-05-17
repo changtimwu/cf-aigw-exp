@@ -1,7 +1,7 @@
 import { createReadStream, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { openai, describeMode } from "./client.js";
-import { config, openaiBaseURL } from "./config.js";
+import { config, mode } from "./config.js";
 
 async function main() {
   const audio = resolve(config.audioPath);
@@ -12,10 +12,10 @@ async function main() {
     process.exit(2);
   }
 
-  console.log(`Gateway:  ${openaiBaseURL}`);
-  console.log(`Mode:     ${describeMode()}`);
-  console.log(`Audio:    ${audio}`);
-  console.log(`Sending:  audio.transcriptions.create whisper-1 ...\n`);
+  console.log(`Backend: ${mode.openaiBaseURL}`);
+  console.log(`Mode:    ${describeMode()}`);
+  console.log(`Audio:   ${audio}`);
+  console.log(`Sending: audio.transcriptions.create whisper-1 ...\n`);
 
   const t0 = Date.now();
   const res = await openai.audio.transcriptions.create({

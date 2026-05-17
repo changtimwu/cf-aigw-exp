@@ -1,10 +1,10 @@
 import { openai, describeMode } from "./client.js";
-import { openaiBaseURL } from "./config.js";
+import { mode } from "./config.js";
 
 async function main() {
-  console.log(`Gateway:  ${openaiBaseURL}`);
-  console.log(`Mode:     ${describeMode()}`);
-  console.log(`Sending:  streaming chat.completions ...\n`);
+  console.log(`Backend: ${mode.openaiBaseURL}`);
+  console.log(`Mode:    ${describeMode()}`);
+  console.log(`Sending: streaming chat.completions ...\n`);
 
   const t0 = Date.now();
   const stream = await openai.chat.completions.create({

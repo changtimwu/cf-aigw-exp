@@ -1,9 +1,11 @@
 node_modules/
 .env
 .env.local
+.dev.vars
 *.log
 .DS_Store
 dist/
+.wrangler/
 samples/*.wav
 samples/*.mp3
 samples/*.m4a

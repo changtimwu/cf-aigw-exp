@@ -1,10 +1,10 @@
 import { openai, describeMode } from "./client.js";
-import { openaiBaseURL } from "./config.js";
+import { mode } from "./config.js";
 
 async function main() {
-  console.log(`Gateway:  ${openaiBaseURL}`);
-  console.log(`Mode:     ${describeMode()}`);
-  console.log(`Sending:  chat.completions.create gpt-4o-mini ...\n`);
+  console.log(`Backend: ${mode.openaiBaseURL}`);
+  console.log(`Mode:    ${describeMode()}`);
+  console.log(`Sending: chat.completions.create gpt-4o-mini ...\n`);
 
   const t0 = Date.now();
   const res = await openai.chat.completions.create({
