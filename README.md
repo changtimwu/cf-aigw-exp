@@ -13,8 +13,10 @@ chat alike.
 [cfaigw]: https://www.cloudflare.com/products/ai-gateway/
 
 See [SCALING.md](SCALING.md) for the architecture's actual ceilings,
-and [REALTIME_BYPASS.md](REALTIME_BYPASS.md) for why realtime WS
-traffic skips AI Gateway today.
+[REALTIME_BYPASS.md](REALTIME_BYPASS.md) for why realtime WS
+traffic skips AI Gateway today, and
+[OPERATIONS.md](OPERATIONS.md) for day-to-day commands against the
+deployed Worker.
 
 ## Why this exists
 
