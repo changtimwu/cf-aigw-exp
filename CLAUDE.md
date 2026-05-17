@@ -61,7 +61,8 @@ added later, prefer `node --test` over pulling in a dependency.
 `OPENAI_API_KEY` is set:
 
 - empty → **BYOK** (gateway holds the OpenAI key; the SDK still
-  needs *some* `apiKey` string, we pass `sk-byok-placeholder`)
+  needs *some* `apiKey` string, we pass `sk-byok-placeholder` but
+  the resulting `Authorization` header is stripped — see below)
 - non-empty → **pass-through** (gateway forwards the client's key
   upstream)
 
@@ -70,11 +71,21 @@ whole point is that BYOK lets us *not* hold one client-side. If you
 need a third mode, add it without removing either of the existing
 two.
 
-It is currently **unconfirmed** whether CF AI Gateway's BYOK feature
-covers Whisper (multipart audio upload) on every account plan. If
-`probe-whisper` fails in BYOK mode, try it again with
-`OPENAI_API_KEY` set; that tells us whether it's a BYOK-coverage
-issue or a wire-format issue.
+**BYOK requires no `Authorization` header.** Empirically confirmed:
+CF AI Gateway's Stored Keys feature only substitutes the upstream
+provider key when the client sends *no* `Authorization` header.
+If `Authorization` is present, the gateway forwards its value to
+OpenAI as-is and never touches the stored key. The OpenAI SDK
+unconditionally sets `Authorization: Bearer <apiKey>`, so in BYOK
+mode `client.ts` passes `Authorization: null` in `defaultHeaders` —
+the SDK's `applyHeadersMut` treats null as "delete this header"
+(see `node_modules/openai/core.js` line ~848). This is not in any
+CF doc we found; preserve it. The CF gateway auth header
+(`cf-aig-authorization`) is always sent regardless of mode.
+
+BYOK works for both chat completions *and* Whisper (multipart
+audio upload). Both were verified end-to-end against
+`gpt-4o-mini` and `whisper-1` on the `aigw-exp-poc` gateway.
 
 ## Environment quirks
 
