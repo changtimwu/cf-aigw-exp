@@ -58,7 +58,12 @@ function merge(record: UserRecord, usage: UsageState) {
 }
 
 async function postUsers(request: Request, env: Env): Promise<Response> {
-  let body: { sub?: string; allowed_models?: string[]; token_budget?: number };
+  let body: {
+    sub?: string;
+    allowed_models?: string[];
+    token_budget?: number;
+    audio_seconds_budget?: number;
+  };
   try {
     body = await request.json();
   } catch {
@@ -71,6 +76,7 @@ async function postUsers(request: Request, env: Env): Promise<Response> {
     sub: body.sub,
     allowed_models: body.allowed_models,
     token_budget: body.token_budget,
+    audio_seconds_budget: body.audio_seconds_budget,
   });
   const usage = await getUsage(env, out.user.sub);
   return json(201, { user: merge(out.user, usage), api_key: out.api_key });

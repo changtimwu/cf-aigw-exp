@@ -1,17 +1,20 @@
 import type { Env } from "./env.js";
 
 // Static user identity + config. The live counters
-// (tokens_used, last_request_at) live in a Durable Object — see usage.ts.
+// (tokens_used, audio_seconds_used, last_request_at) live in a Durable
+// Object — see usage.ts.
 export type UserRecord = {
   sub: string;
-  allowed_models: string[]; // empty array = unrestricted
-  token_budget: number;     // 0 = unlimited
+  allowed_models: string[];     // empty array = unrestricted
+  token_budget: number;          // 0 = unlimited (REST chat tokens)
+  audio_seconds_budget: number;  // 0 = unlimited (realtime audio seconds)
   created_at: number;
   revoked: boolean;
 };
 
 const DEFAULT_ALLOWED_MODELS = ["gpt-4o-mini", "whisper-1", "gpt-realtime-whisper"];
 const DEFAULT_TOKEN_BUDGET = 100_000;
+const DEFAULT_AUDIO_SECONDS_BUDGET = 600; // 10 minutes
 
 const API_KEY_PREFIX = "aigwk_";
 
@@ -50,6 +53,7 @@ export type CreateUserInput = {
   sub: string;
   allowed_models?: string[];
   token_budget?: number;
+  audio_seconds_budget?: number;
 };
 
 export async function createUser(
@@ -67,6 +71,7 @@ export async function createUser(
     sub: input.sub,
     allowed_models: input.allowed_models ?? DEFAULT_ALLOWED_MODELS,
     token_budget: input.token_budget ?? DEFAULT_TOKEN_BUDGET,
+    audio_seconds_budget: input.audio_seconds_budget ?? DEFAULT_AUDIO_SECONDS_BUDGET,
     created_at: now,
     revoked: false,
   };

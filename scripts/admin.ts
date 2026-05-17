@@ -95,10 +95,12 @@ async function main() {
       const sub = require_("sub", flag("sub"));
       const models = flag("models");
       const budget = flag("budget");
+      const audioBudget = flag("audio-budget");
       result = await call(url, token, "POST", "/admin/users", {
         sub,
         ...(models ? { allowed_models: models.split(",").map((s) => s.trim()) } : {}),
         ...(budget ? { token_budget: parseInt(budget, 10) } : {}),
+        ...(audioBudget ? { audio_seconds_budget: parseInt(audioBudget, 10) } : {}),
       });
       break;
     }

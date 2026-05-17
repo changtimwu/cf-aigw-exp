@@ -20,7 +20,7 @@ that bypasses AI Gateway for one specific reason (see
 REALTIME_BYPASS.md). The repo exists because the underlying
 desktop app is being productized.
 
-The repo implements **Phases 1, 2 (history), 3, 4, 5a**:
+The repo implements **Phases 1, 2 (history), 3, 4, 5a, 5b**:
 - Phase 1: REST probes against AI Gateway with BYOK.
 - Phase 2 (superseded, in git history): Worker validating per-user
   HS256 JWTs.
@@ -32,10 +32,15 @@ The repo implements **Phases 1, 2 (history), 3, 4, 5a**:
   OpenAI direct (`https://api.openai.com/v1/realtime`) using a
   Worker-secret copy of the OpenAI key, because CF AI Gateway's
   WS proxy doesn't currently route OpenAI's GA Realtime shape.
+- Phase 5b: audio-seconds metering for realtime. The Worker
+  counts base64-decoded PCM bytes on the client→upstream leg and
+  flushes to a new `audio_seconds_used` field in the per-user DO
+  on each `conversation.item.input_audio_transcription.completed`
+  event (and on socket close, for safety). A separate
+  `audio_seconds_budget` on the UserRecord gates new sessions.
 
-Phase 5b (audio-seconds metering for realtime) and Phase 6 (real
-login flow, DO Hibernation API for realtime, AI Gateway log
-reconciliation) are out of scope.
+Phase 6 (real login flow, DO Hibernation API for realtime, AI
+Gateway log reconciliation) is out of scope.
 
 ## Architecture decisions (don't relitigate without asking)
 
@@ -63,10 +68,16 @@ reconciliation) are out of scope.
   Default `allowed_models` includes `gpt-realtime-whisper` now.
 - `src/worker/usage.ts` — `UsageCounter` Durable Object + helpers.
 - `src/worker/admin.ts` — `/admin/*` handlers; merges KV+DO views.
-- `src/worker/realtime.ts` — Phase 5a. WS upgrade → auth →
-  pre-checks → upstream `fetch(https://..., { Upgrade: "websocket" })`
-  → `WebSocketPair` → bidirectional pump. **No usage metering yet**
-  (Phase 5b will add audio-byte counting).
+- `src/worker/realtime.ts` — Phase 5a+5b. WS upgrade → auth →
+  pre-checks (token budget AND audio budget) → upstream
+  `fetch(https://..., { Upgrade: "websocket" })` → `WebSocketPair`
+  → bidirectional pump. On each client→upstream message, peek for
+  `input_audio_buffer.append` and accumulate base64-decoded byte
+  count. On each upstream→client `conversation.item.input_audio_transcription.completed`,
+  divide by 48 000 (24 kHz mono PCM16 bytes/sec) and
+  `ctx.waitUntil(incrementAudioDO(...))`. On socket close, flush
+  any pending bytes too. Uses regex peek instead of full
+  `JSON.parse` on every chunk to keep the hot path tight.
 - `src/worker/index.ts` — main handler. Order of operations is
   load-bearing:
     1. OPTIONS → CORS.
@@ -146,6 +157,12 @@ Worker (24 kHz mono PCM16 → 48 000 B/s).
 The probe expects `samples/hello-24k.pcm`. Generate from any wav:
 `ffmpeg -i input.wav -ar 24000 -ac 1 -f s16le samples/hello-24k.pcm`.
 The committed file is small enough to keep in the repo.
+
+### 13. Audio-seconds math assumes 24 kHz mono PCM16
+`realtime.ts` divides decoded audio bytes by `48 000` to get
+seconds. If a client uses a different rate or stereo, billing is
+wrong. Robust fix: peek the rate from `session.update` on the way
+through and track it per-session. Deferred to Phase 6.
 
 ## Environment quirks
 

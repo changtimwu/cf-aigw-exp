@@ -2,21 +2,21 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env.js";
 
 // Per-user usage counter held in a Durable Object. One DO instance per
-// `sub`, keyed via `env.USAGE.idFromName(sub)`. The DO model serialises
-// reads/writes to one instance — no rate limit, atomic.
+// `sub`, keyed via `env.USAGE.idFromName(sub)`. Atomic — no rate limit.
 //
 // Storage layout (per DO):
-//   tokens_used:     number
-//   last_request_at: number  (seconds since epoch)
+//   tokens_used:        number  (REST chat tokens, sum)
+//   audio_seconds_used: number  (realtime audio time, sum) — Phase 5b
+//   last_request_at:    number  (seconds since epoch)
 
 export type UsageState = {
   tokens_used: number;
+  audio_seconds_used: number;
   last_request_at: number;
 };
 
 export class UsageCounter extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
-    // Alias to keep the helper bodies untouched after the base-class refactor.
     const state = this.ctx;
     const url = new URL(request.url);
     switch (url.pathname) {
@@ -24,9 +24,23 @@ export class UsageCounter extends DurableObject<Env> {
         if (request.method !== "POST") return json(405, { error: "method" });
         const body = (await request.json()) as { tokens?: number };
         const tokens = typeof body.tokens === "number" ? body.tokens : 0;
-        const prev = (await state.storage.get<number>("tokens_used")) ?? 0;
+        const cur = await readState(state);
         const next: UsageState = {
-          tokens_used: prev + tokens,
+          ...cur,
+          tokens_used: cur.tokens_used + tokens,
+          last_request_at: Math.floor(Date.now() / 1000),
+        };
+        await state.storage.put(next);
+        return json(200, next);
+      }
+      case "/increment-audio": {
+        if (request.method !== "POST") return json(405, { error: "method" });
+        const body = (await request.json()) as { seconds?: number };
+        const seconds = typeof body.seconds === "number" ? body.seconds : 0;
+        const cur = await readState(state);
+        const next: UsageState = {
+          ...cur,
+          audio_seconds_used: cur.audio_seconds_used + seconds,
           last_request_at: Math.floor(Date.now() / 1000),
         };
         await state.storage.put(next);
@@ -34,19 +48,29 @@ export class UsageCounter extends DurableObject<Env> {
       }
       case "/get": {
         if (request.method !== "GET") return json(405, { error: "method" });
-        const tokens_used = (await state.storage.get<number>("tokens_used")) ?? 0;
-        const last_request_at = (await state.storage.get<number>("last_request_at")) ?? 0;
-        return json(200, { tokens_used, last_request_at });
+        return json(200, await readState(state));
       }
       case "/reset": {
         if (request.method !== "POST") return json(405, { error: "method" });
         await state.storage.deleteAll();
-        return json(200, { tokens_used: 0, last_request_at: 0 });
+        return json(200, {
+          tokens_used: 0,
+          audio_seconds_used: 0,
+          last_request_at: 0,
+        } satisfies UsageState);
       }
       default:
         return json(404, { error: "not_found" });
     }
   }
+}
+
+async function readState(state: DurableObjectState): Promise<UsageState> {
+  return {
+    tokens_used: (await state.storage.get<number>("tokens_used")) ?? 0,
+    audio_seconds_used: (await state.storage.get<number>("audio_seconds_used")) ?? 0,
+    last_request_at: (await state.storage.get<number>("last_request_at")) ?? 0,
+  };
 }
 
 function json(status: number, body: unknown): Response {
@@ -77,6 +101,20 @@ export async function incrementUsageDO(
   const res = await stub(env, sub).fetch("https://do/increment", {
     method: "POST",
     body: JSON.stringify({ tokens }),
+    headers: { "content-type": "application/json" },
+  });
+  return (await res.json()) as UsageState;
+}
+
+export async function incrementAudioDO(
+  env: Env,
+  sub: string,
+  seconds: number,
+): Promise<UsageState> {
+  if (seconds <= 0) return getUsage(env, sub);
+  const res = await stub(env, sub).fetch("https://do/increment-audio", {
+    method: "POST",
+    body: JSON.stringify({ seconds }),
     headers: { "content-type": "application/json" },
   });
   return (await res.json()) as UsageState;

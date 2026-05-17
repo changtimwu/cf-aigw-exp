@@ -1,6 +1,6 @@
 # cf-aigw-exp
 
-**Status:** Phase 5a (realtime transcription via WebSocket, direct-to-OpenAI bypass) — experimental, not for production use.
+**Status:** Phase 5b (realtime transcription + per-session audio-seconds metering) — experimental, not for production use.
 
 A proof-of-concept for routing an internal OpenAI-powered desktop app's
 traffic through [Cloudflare AI Gateway][cfaigw] as it transitions from
@@ -55,9 +55,10 @@ for direct mode.
 | 2     | Cloudflare Worker for per-user JWT auth.                                                        | done (superseded by Phase 3) |
 | 3     | KV-backed user store, opaque API keys, model allow-list, token budget, revocation, admin CLI.   | done                         |
 | 4     | Durable Objects for atomic per-user counters; streaming chat token accounting via SSE tee.      | done                         |
-| **5a**| Realtime WebSocket (`gpt-realtime-whisper`) transcription. Worker dials OpenAI direct           | ← we are here                |
+| 5a    | Realtime WebSocket (`gpt-realtime-whisper`) transcription. Worker dials OpenAI direct           | done                         |
 |       | (bypasses AI Gateway — see [REALTIME_BYPASS.md](REALTIME_BYPASS.md)).                           |                              |
-| 5b    | Realtime audio-seconds accounting (count bytes through the Worker, debit DO counter).           | not yet                      |
+| **5b**| Realtime audio-seconds accounting. Worker counts base64-decoded PCM bytes per session and       | ← we are here                |
+|       | flushes to a new `audio_seconds_used` field in the per-user DO.                                 |                              |
 | 6     | Real login flow, per-org admin, billing, AI Gateway logs reconciliation, DO Hibernation API     | not yet                      |
 |       | for realtime sessions at scale.                                                                 |                              |
 
@@ -86,7 +87,9 @@ npm run worker:dev               # wrangler dev on http://localhost:8787, local 
 export CF_WORKER_URL=http://localhost:8787
 
 # Provision a user; the response includes the api_key (shown ONCE).
-npm run admin -- create-user --sub alice --models gpt-4o-mini,whisper-1 --budget 50000
+npm run admin -- create-user --sub alice \
+  --models gpt-4o-mini,whisper-1,gpt-realtime-whisper \
+  --budget 50000 --audio-budget 600
 # → { user: {...}, api_key: "aigwk_…" }
 
 export USER_API_KEY=aigwk_…      # paste from above
@@ -137,15 +140,17 @@ Durable Object.
 
 | Method  | Path                              | Body                                          | Notes                                  |
 | ------- | --------------------------------- | --------------------------------------------- | -------------------------------------- |
-| POST    | `/admin/users`                    | `{ sub, allowed_models?, token_budget? }`     | Returns user + the api_key (shown once)|
+| POST    | `/admin/users`                    | `{ sub, allowed_models?, token_budget?, audio_seconds_budget? }` | Returns user + the api_key (shown once) |
 | GET     | `/admin/users`                    | —                                             | Lists all users with usage             |
 | GET     | `/admin/users/:sub`               | —                                             | One user                               |
 | DELETE  | `/admin/users/:sub`               | —                                             | Marks revoked=true (key invalidated)   |
 | POST    | `/admin/users/:sub/reset-usage`   | —                                             | Clears the DO counter for that user    |
 
-Defaults on create: `allowed_models=["gpt-4o-mini","whisper-1"]`,
-`token_budget=100000`. An empty `allowed_models` array means
-unrestricted; `token_budget=0` means unlimited.
+Defaults on create:
+`allowed_models=["gpt-4o-mini","whisper-1","gpt-realtime-whisper"]`,
+`token_budget=100000`, `audio_seconds_budget=600` (10 minutes).
+An empty `allowed_models` array means unrestricted; either budget
+set to `0` means unlimited for that dimension.
 
 ## How usage is counted
 
@@ -156,9 +161,11 @@ unrestricted; `token_budget=0` means unlimited.
 |                               |                                                           | SSE response, parses the trailing chunk in `waitUntil`     |
 | Whisper-1 transcription (REST)| No                                                        | Whisper response has no token field. Still requires valid  |
 |                               |                                                           | API key but doesn't decrement budget.                      |
-| Realtime transcription (WS)   | **Not yet (Phase 5b)**                                    | Worker forwards audio but doesn't count bytes against      |
-|                               |                                                           | the budget. Pre-flight budget check still rejects if the   |
-|                               |                                                           | user is already over from chat usage.                      |
+| Realtime transcription (WS)   | Yes (Phase 5b)                                            | Worker base64-counts each `input_audio_buffer.append`      |
+|                               |                                                           | client→upstream; flushes to `audio_seconds_used` on the    |
+|                               |                                                           | matching `conversation.item.input_audio_transcription      |
+|                               |                                                           | .completed` event. Pre-flight rejects new sessions when    |
+|                               |                                                           | `audio_seconds_used >= audio_seconds_budget`.              |
 | Embeddings, other endpoints   | No (current code)                                         | Easy follow-up; same JSON-usage pattern as chat            |
 
 Both chat paths land in the same per-user Durable Object via
@@ -261,22 +268,31 @@ Important details:
   ffmpeg -i input.wav -ar 24000 -ac 1 -f s16le samples/hello-24k.pcm
   ```
 
-## Phase 5a known gaps
+## Phase 5b known gaps
 
-- **Realtime is not yet metered.** Audio sent through realtime
-  sessions does not decrement `tokens_used` — Phase 5b adds
-  byte-counting in the Worker and a `audio_seconds_used` field
-  on the DO state. Pre-flight budget check still applies, so a
-  user can't open a realtime session if they're already over
-  from chat usage.
+- **Audio rate is hardcoded to 24 kHz mono PCM16** in the
+  audio-seconds math (`bytes / 48000`). Clients sending audio at
+  another rate (e.g. 16 kHz mono PCM16 = 32 000 B/s) will be billed
+  incorrectly. Fix: parse `session.update.audio.input.format.rate`
+  on the way through and recompute per-session.
+- **Pre-flight enforcement only.** Once a realtime session is
+  established, mid-session audio that pushes the user over budget
+  is still counted but not interrupted. Same shape as Phase 4's
+  streaming chat enforcement. A new session after the overage is
+  rejected.
 - **No per-session-model enforcement.** We check that *some*
   realtime model is in the user's allow-list. The specific
   transcription model is in user-controlled
   `session.update.audio.input.transcription.model`, which we don't
   inspect.
 - **Realtime traffic doesn't appear in AI Gateway dashboard.** It
-  bypasses the gateway. OpenAI's billing dashboard and our
-  DO counter (post-5b) are the metering sources of truth.
+  bypasses the gateway. OpenAI's billing dashboard and our DO
+  counter are the metering sources of truth.
+- **Mid-segment disconnects lose accuracy.** If the WS closes
+  before the `completed` event for an in-flight audio segment, the
+  Worker flushes whatever bytes accumulated — but those bytes may
+  not have been fully processed upstream. Difference is small in
+  practice; OpenAI's bill is still authoritative.
 
 ## Phase 4 known gaps
 
