@@ -10,7 +10,7 @@ export type UserRecord = {
   revoked: boolean;
 };
 
-const DEFAULT_ALLOWED_MODELS = ["gpt-4o-mini", "whisper-1"];
+const DEFAULT_ALLOWED_MODELS = ["gpt-4o-mini", "whisper-1", "gpt-realtime-whisper"];
 const DEFAULT_TOKEN_BUDGET = 100_000;
 
 const API_KEY_PREFIX = "aigwk_";

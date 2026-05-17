@@ -1,5 +1,6 @@
 import type { Env } from "./env.js";
 import { handleAdmin } from "./admin.js";
+import { handleRealtime } from "./realtime.js";
 import { getUserByApiKey, type UserRecord } from "./users.js";
 import { getUsage, incrementUsageDO } from "./usage.js";
 
@@ -21,6 +22,13 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    // Realtime WebSocket sessions bypass AI Gateway and dial OpenAI direct;
+    // see REALTIME_BYPASS.md for the rationale. Any WS upgrade is treated as
+    // a realtime request regardless of path.
+    if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      return handleRealtime(request, env, ctx);
     }
 
     const url = new URL(request.url);

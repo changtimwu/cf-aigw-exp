@@ -1,6 +1,6 @@
 # cf-aigw-exp
 
-**Status:** Phase 4 (Durable Objects counters + streaming token accounting) — experimental, not for production use.
+**Status:** Phase 5a (realtime transcription via WebSocket, direct-to-OpenAI bypass) — experimental, not for production use.
 
 A proof-of-concept for routing an internal OpenAI-powered desktop app's
 traffic through [Cloudflare AI Gateway][cfaigw] as it transitions from
@@ -12,7 +12,9 @@ chat alike.
 
 [cfaigw]: https://www.cloudflare.com/products/ai-gateway/
 
-See [SCALING.md](SCALING.md) for the architecture's actual ceilings.
+See [SCALING.md](SCALING.md) for the architecture's actual ceilings,
+and [REALTIME_BYPASS.md](REALTIME_BYPASS.md) for why realtime WS
+traffic skips AI Gateway today.
 
 ## Why this exists
 
@@ -52,10 +54,12 @@ for direct mode.
 | 1     | Validate the proxy path. Chat, streaming chat, Whisper all work through AI Gateway BYOK.        | done                         |
 | 2     | Cloudflare Worker for per-user JWT auth.                                                        | done (superseded by Phase 3) |
 | 3     | KV-backed user store, opaque API keys, model allow-list, token budget, revocation, admin CLI.   | done                         |
-| **4** | Durable Objects for atomic per-user counters; streaming chat token accounting via SSE tee.      | ← we are here                |
-| 5     | Real login flow (signup, password/OAuth, sessions). Whisper time-based quota. Per-org admin     | not yet                      |
-|       | separation. Billing/Stripe integration. AI Gateway logs-driven retro-metering for higher        |                              |
-|       | accuracy than per-request parsing.                                                              |                              |
+| 4     | Durable Objects for atomic per-user counters; streaming chat token accounting via SSE tee.      | done                         |
+| **5a**| Realtime WebSocket (`gpt-realtime-whisper`) transcription. Worker dials OpenAI direct           | ← we are here                |
+|       | (bypasses AI Gateway — see [REALTIME_BYPASS.md](REALTIME_BYPASS.md)).                           |                              |
+| 5b    | Realtime audio-seconds accounting (count bytes through the Worker, debit DO counter).           | not yet                      |
+| 6     | Real login flow, per-org admin, billing, AI Gateway logs reconciliation, DO Hibernation API     | not yet                      |
+|       | for realtime sessions at scale.                                                                 |                              |
 
 ## Quick start
 
@@ -89,7 +93,8 @@ export USER_API_KEY=aigwk_…      # paste from above
 
 npm run probe:chat               # non-streaming — increments tokens_used
 npm run probe:stream             # streaming — ALSO increments tokens_used (Phase 4)
-npm run probe:whisper            # Whisper — no token count to track
+npm run probe:whisper            # Whisper-1 REST — no token count to track
+npm run probe:realtime           # gpt-realtime-whisper WS — Phase 5a; not metered yet
 
 npm run admin -- get-user --sub alice    # tokens_used reflects all chat traffic
 npm run admin -- list-users
@@ -149,8 +154,11 @@ unrestricted; `token_budget=0` means unlimited.
 | Non-streaming chat completion | Yes                                                       | Parse `usage.total_tokens` from JSON response              |
 | Streaming chat completion     | Yes (Phase 4)                                             | Worker injects `stream_options.include_usage`, tees the    |
 |                               |                                                           | SSE response, parses the trailing chunk in `waitUntil`     |
-| Whisper transcription         | No                                                        | Whisper response has no token field. Still requires valid  |
+| Whisper-1 transcription (REST)| No                                                        | Whisper response has no token field. Still requires valid  |
 |                               |                                                           | API key but doesn't decrement budget.                      |
+| Realtime transcription (WS)   | **Not yet (Phase 5b)**                                    | Worker forwards audio but doesn't count bytes against      |
+|                               |                                                           | the budget. Pre-flight budget check still rejects if the   |
+|                               |                                                           | user is already over from chat usage.                      |
 | Embeddings, other endpoints   | No (current code)                                         | Easy follow-up; same JSON-usage pattern as chat            |
 
 Both chat paths land in the same per-user Durable Object via
@@ -195,9 +203,11 @@ Two sub-modes for direct (controlled by `OPENAI_API_KEY` in `.env`):
 │   ├── probe-chat.ts
 │   ├── probe-stream.ts
 │   ├── probe-whisper.ts
+│   ├── probe-realtime.ts        ← Phase 5a: WS to Worker, stream PCM, log transcript
 │   └── worker/
 │       ├── index.ts             ← main handler: auth + body shaping + proxy + SSE tee
 │       ├── admin.ts             ← /admin/* handlers
+│       ├── realtime.ts          ← Phase 5a: WS upgrade → OpenAI Realtime (bypass)
 │       ├── users.ts             ← KV store: identity + config (no counters)
 │       ├── usage.ts             ← UsageCounter DO + getUsage/increment/reset helpers
 │       └── env.ts               ← Env bindings (KV + DO + secrets)
@@ -205,6 +215,68 @@ Two sub-modes for direct (controlled by `OPENAI_API_KEY` in `.env`):
 │   └── admin.ts                 ← CLI client for /admin/* endpoints
 └── samples/                     ← Whisper audio inputs (gitignored)
 ```
+
+## Realtime transcription (Phase 5a)
+
+The Worker accepts WebSocket upgrades on any path. The body of the
+URL doesn't matter to us — by convention the desktop app uses
+`wss://<worker>/v1/realtime?intent=transcription` to match the
+OpenAI URL shape.
+
+```bash
+# After provisioning a user with gpt-realtime-whisper in their allow-list:
+npm run admin -- create-user --sub alice --models gpt-realtime-whisper,gpt-4o-mini
+export CF_WORKER_URL=http://localhost:8787
+export USER_API_KEY=aigwk_…
+
+# Run the probe (uses samples/hello-24k.pcm — 24 kHz mono PCM16 raw)
+AUDIO_PATH=samples/hello-24k.pcm npm run probe:realtime
+```
+
+Important details:
+
+- The Worker validates the user's API key on the **WebSocket
+  upgrade request** (`Authorization: Bearer <api_key>` header).
+  After upgrade, the auth is established for the life of the
+  socket.
+- The Worker dials OpenAI directly at
+  `https://api.openai.com/v1/realtime?...` because CF AI Gateway's
+  WS proxy doesn't currently handle the GA Realtime shape. The
+  Worker carries a copy of the OpenAI key as a secret
+  (`OPENAI_API_KEY`) for this hop only. **REST traffic continues
+  through AI Gateway**, unchanged. See
+  [REALTIME_BYPASS.md](REALTIME_BYPASS.md).
+- The client's query string is forwarded verbatim — works for both
+  `?intent=transcription` (transcription-only sessions, which use
+  `gpt-realtime-whisper` inside `session.update.audio.input.transcription.model`)
+  and `?model=<realtime-session-model>` (bidirectional sessions).
+- The Worker doesn't parse session.update payloads. The model
+  allow-list check is "does the user have any realtime model in
+  their list", which means a user who can use *any* realtime path
+  can switch transcription models inside their session. Refinement
+  is Phase 5b/6 work.
+- Audio must be **24 kHz mono PCM16**, base64-encoded inside
+  `input_audio_buffer.append` events. Convert with:
+  ```
+  ffmpeg -i input.wav -ar 24000 -ac 1 -f s16le samples/hello-24k.pcm
+  ```
+
+## Phase 5a known gaps
+
+- **Realtime is not yet metered.** Audio sent through realtime
+  sessions does not decrement `tokens_used` — Phase 5b adds
+  byte-counting in the Worker and a `audio_seconds_used` field
+  on the DO state. Pre-flight budget check still applies, so a
+  user can't open a realtime session if they're already over
+  from chat usage.
+- **No per-session-model enforcement.** We check that *some*
+  realtime model is in the user's allow-list. The specific
+  transcription model is in user-controlled
+  `session.update.audio.input.transcription.model`, which we don't
+  inspect.
+- **Realtime traffic doesn't appear in AI Gateway dashboard.** It
+  bypasses the gateway. OpenAI's billing dashboard and our
+  DO counter (post-5b) are the metering sources of truth.
 
 ## Phase 4 known gaps
 

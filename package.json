@@ -8,6 +8,7 @@
     "probe:chat": "tsx src/probe-chat.ts",
     "probe:stream": "tsx src/probe-stream.ts",
     "probe:whisper": "tsx src/probe-whisper.ts",
+    "probe:realtime": "tsx src/probe-realtime.ts",
     "probe:all": "npm run probe:chat && npm run probe:stream && npm run probe:whisper",
     "admin": "tsx scripts/admin.ts",
     "spike:realtime": "tsx scripts/spike-realtime.ts",
