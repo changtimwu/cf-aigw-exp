@@ -10,6 +10,8 @@
     "probe:whisper": "tsx src/probe-whisper.ts",
     "probe:all": "npm run probe:chat && npm run probe:stream && npm run probe:whisper",
     "admin": "tsx scripts/admin.ts",
+    "spike:realtime": "tsx scripts/spike-realtime.ts",
+    "spike:realtime-direct": "tsx scripts/spike-realtime-direct.ts",
     "worker:dev": "wrangler dev",
     "worker:deploy": "wrangler deploy",
     "worker:typecheck": "tsc -p tsconfig.worker.json --noEmit",
@@ -22,7 +24,9 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260517.1",
     "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "ws": "^8.20.1"
   }
 }

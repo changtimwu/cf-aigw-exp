@@ -6,6 +6,7 @@ node_modules/
 .DS_Store
 dist/
 .wrangler/
+tmp/
 samples/*.wav
 samples/*.mp3
 samples/*.m4a
