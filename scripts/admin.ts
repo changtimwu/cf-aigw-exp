@@ -63,11 +63,12 @@ async function call(
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  let data: unknown = null;
+  const text = await res.text();
+  let data: unknown;
   try {
-    data = await res.json();
+    data = JSON.parse(text);
   } catch {
-    data = { raw: await res.text() };
+    data = { raw: text };
   }
   return { status: res.status, data };
 }

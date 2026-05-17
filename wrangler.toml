@@ -14,7 +14,7 @@ CF_AIGW_ID = "aigw-exp-poc"
 # replace the id below with the one wrangler prints.
 [[kv_namespaces]]
 binding = "USERS"
-id = "PLACEHOLDER_REPLACE_BEFORE_DEPLOY"
+id = "dae44091b36542d3928f1107e944ccae"
 
 # Durable Object: per-user atomic usage counter. See src/worker/usage.ts and
 # SCALING.md for why this replaces the KV-stored counter from Phase 3.
