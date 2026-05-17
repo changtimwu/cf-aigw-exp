@@ -1,0 +1,23 @@
+{
+  "name": "cf-aigw-exp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PoC: route OpenAI traffic through Cloudflare AI Gateway with vendor-held key (BYOK option B).",
+  "type": "module",
+  "scripts": {
+    "probe:chat": "tsx src/probe-chat.ts",
+    "probe:stream": "tsx src/probe-stream.ts",
+    "probe:whisper": "tsx src/probe-whisper.ts",
+    "probe:all": "npm run probe:chat && npm run probe:stream && npm run probe:whisper",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.73.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.local
+*.log
+.DS_Store
+dist/
+samples/*.wav
+samples/*.mp3
+samples/*.m4a
+!samples/.gitkeep
